@@ -32,13 +32,18 @@ __docformat__ = 'restructuredtext'
 
 import weakref
 import operator
-
+import threading
 from taurus.external.qt import Qt
-
+import time
 from taurus.core import DataFormat, AttrQuality, DataType
 
 from taurus.qt.qtgui.base import TaurusBaseWidget
 from qled import QLed
+import taurus
+import elasticapm
+from taurus.core.util.event import (CallableRef,
+                         BoundMethodWeakref)
+from functools import wraps # This convenience func preserves name and docstring
 
 _QT_PLUGIN_INFO = {
     'module': 'taurus.qt.qtgui.display',
@@ -107,7 +112,7 @@ class _TaurusLedController(object):
         key = None
         try:
             key = self.value()
-        except Exception:
+        except Exception, e:
             pass
         ledMap = self.LedMap
         if widget.fgRole == 'quality':
@@ -225,6 +230,131 @@ class TaurusLed(QLed, TaurusBaseWidget):
         # creation of a controller object
         if self._designMode:
             self.controller().update()
+        if parent is not None:
+            service_name = parent
+        else:
+            service_name = self.log_name
+
+        self.client = elasticapm.Client({'SERVICE_NAME': service_name})
+        self.events_received = 0
+        self.events_ts = []
+        self._events_fr = {}
+        self._events_fr[1] = []
+        self._events_fr[10] = []
+        self.t = threading.Thread(target=self.calculate_events)
+        self.t.start()
+
+    def calculate_events(self):
+        t1 = time.time()
+        t = 1
+        while True:
+            time.sleep(t)
+            ev = len(self.events_ts)
+            self.events_ts = []
+            for i in self._events_fr.keys():
+                self._events_fr[i].append(ev)
+                if len(self._events_fr[i]) > (i/t):
+                    self._events_fr[i].pop()
+            if time.time() - t1 > 10:
+                self.controller().update()
+                t1 = time.time()
+
+    def addListeners(self):
+        factory = taurus.Factory()
+        attrs = factory.getExistingAttributes()
+        for attr_name, attr_obj in attrs.items():
+
+            # To add APM min the listeners
+            listeners = attr_obj._listeners
+            if listeners is None:
+                continue
+
+            if not operator.isSequenceType(listeners):
+                listeners = listeners,
+
+            for listener in listeners:
+                if isinstance(listener, weakref.ref) or isinstance(listener,
+                                                                   BoundMethodWeakref):
+                    l = listener()
+                else:
+                    l = listener
+                if l is None:
+                    continue
+                meth = getattr(l, 'eventReceived', None)
+                if meth is not None and operator.isCallable(meth):
+                    org = l.eventReceived
+                    l.eventReceived = self.transaction_dec(self.span_dec(org))
+                elif operator.isCallable(l):
+                    org = l
+                    l = self.transaction_dec(self.span_dec(org))
+
+            # To Count the time between the event creation and the event
+            # managment
+            attr_obj.addListener(self.diagnostic_listener)
+            print 'listener added'
+
+    def span_dec(self, f):
+
+        @elasticapm.capture_span()
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            return f(*args, **kwargs)
+        return wrapper
+
+
+    # Decorator to use APM
+    def transaction_dec(self, f):
+
+        def wrapper(*args, **kwargs):
+            #client = elasticapm.Client({'SERVICE_NAME': 'Taurus Listeners'})
+
+            self.client.begin_transaction(f.func_name)
+
+            ret = f(*args, **kwargs)
+            self.client.end_transaction(self.modelName, 'SUCCCESS')
+            return ret
+        return wrapper
+
+    def diagnostic_listener(self, src, type, value):
+        try:
+            source_time = value.time.tv_sec
+        except:
+            return
+        transaction = self.client.begin_transaction('Event Source Listener '
+                                                    'Time')
+        context = {
+            'args': str(src) +'\n.'+str(value),
+            'kwards': repr(self),
+        }
+        elasticapm.set_custom_context(context)
+        transaction.start_time = time.time() - (time.time() - source_time)
+        self.client.end_transaction(src.fullname, 'SUCCESS')# value.value)
+        self.events_received += 1
+        self.events_ts.append(time.time())
+
+
+    def getFormatedToolTip(self, cache=True):
+        """ The tooltip should refer to the device and not the state attribute.
+            That is why this method is being rewritten
+        """
+        if self.modelObj is None:
+            return self.getNoneValue()
+        parent = self.modelObj.getParentObj()
+        if parent is None:
+            return self.getNoneValue()
+        return self.toolTipObjToStr(self.getDisplayDescrObj() )
+
+    def getDisplayDescrObj(self, cache=True):
+        obj = []
+        obj.append(('Events_received', self.events_received))
+        for i in self._events_fr.keys():
+            l = self._events_fr[i]
+            if len(l) == 0:
+                val = 0
+            else:
+                val = sum(l) / float(len(l))
+            obj.append(('Average Hz in %s secs' %i, val))
+        return obj
 
     def _calculate_controller_class(self):
         model = self.getModelObj()
@@ -268,6 +398,7 @@ class TaurusLed(QLed, TaurusBaseWidget):
         # force to build another controller
         self._controller = None
         TaurusBaseWidget.setModel(self, m)
+        self.addListeners()
 
     #-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-
     # QT property definition
@@ -479,7 +610,7 @@ def main():
         layout = Qt.QGridLayout()
         w.setLayout(layout)
         for model in models:
-            led = TaurusLed()
+            led = TaurusLed(parent=app)
             led.model = model
             layout.addWidget(led)
     w.show()

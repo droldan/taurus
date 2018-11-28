@@ -130,6 +130,18 @@ class TaurusFactory(object):
     # it in your scheme factory
     #-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-
 
+    def getAttributesNames(self):
+        return self._attrs.keys()
+
+    def getAttributesNames(self):
+        return self._attrs.keys()
+
+    def getDevicesNames(self):
+        return self._devs.keys()
+
+    def getAuthoritesNames(self):
+        return self._auths.keys()
+
     def getAuthority(self, name=None):
         """Obtain the model object corresponding to the given authority name.
         If the corresponding authority already exists, the existing instance
